@@ -111,7 +111,7 @@ func main() {
 
 	handler := cors.New(cors.Options{
 		AllowedOrigins: []string{"*"},
-		AllowedHeaders: []string{"token", "Content-type"},
+		AllowedHeaders: []string{"token", "Content-type", "Authorization"},
 		Debug:          true,
 	}).Handler(s.router)
 
