@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 	"github.com/nfnt/resize"
 	"github.com/patrickmn/go-cache"
 	"github.com/vincent-petithory/dataurl"
@@ -26,6 +27,12 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
 
 type Values struct {
 	m map[string]string
@@ -57,17 +64,17 @@ func (s *server) authalice(next http.Handler) http.Handler {
 		jid := ""
 		events := ""
 
-		// Get token from headers or uri parameters
-		token := r.Header.Get("token")
-		if token == "" {
-			token = strings.Join(r.URL.Query()["token"], "")
+		// Get id from headers or uri parameters
+		id := r.Header.Get("id")
+		if id == "" {
+			id = r.URL.Query().Get("id")
 		}
 
-		myuserinfo, found := userinfocache.Get(token)
+		myuserinfo, found := userinfocache.Get(id)
 		if !found {
 			log.Info().Msg("Looking for user information in DB")
 			// Checks DB from matching user and store user values in context
-			rows, err := s.db.Query("SELECT id,webhook,jid,events FROM users WHERE token=? LIMIT 1", token)
+			rows, err := s.db.Query("SELECT id,webhook,jid,events FROM users WHERE id=? LIMIT 1", id)
 			if err != nil {
 				s.Respond(w, r, http.StatusInternalServerError, err)
 				return
@@ -84,11 +91,11 @@ func (s *server) authalice(next http.Handler) http.Handler {
 					"Id":      txtid,
 					"Jid":     jid,
 					"Webhook": webhook,
-					"Token":   token,
+					"Token":   id,
 					"Events":  events,
 				}}
 
-				userinfocache.Set(token, v, cache.NoExpiration)
+				userinfocache.Set(id, v, cache.NoExpiration)
 				ctx = context.WithValue(r.Context(), "userinfo", v)
 			}
 		} else {
@@ -96,11 +103,14 @@ func (s *server) authalice(next http.Handler) http.Handler {
 			userid, _ = strconv.Atoi(myuserinfo.(Values).Get("Id"))
 		}
 
-		if userid == 0 {
-			s.Respond(w, r, http.StatusUnauthorized, errors.New("Unauthorized"))
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(ctx))
+		// if userid == 0 {
+		// 	s.Respond(w, r, http.StatusUnauthorized, errors.New("Unauthorized"))
+		// 	return
+		// }
+		// next.ServeHTTP(w, r.WithContext(ctx))
+		fmt.Printf("ctx: %v\n", ctx)
+		fmt.Printf("userid: %v\n", userid)
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -169,73 +179,31 @@ func (s *server) Connect() http.HandlerFunc {
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		webhook := r.Context().Value("userinfo").(Values).Get("Webhook")
-		jid := r.Context().Value("userinfo").(Values).Get("Jid")
-		txtid := r.Context().Value("userinfo").(Values).Get("Id")
-		token := r.Context().Value("userinfo").(Values).Get("Token")
-		userid, _ := strconv.Atoi(txtid)
-		eventstring := ""
+		userId := r.URL.Query().Get("id")
 
-		// Decodes request BODY looking for events to subscribe
-		decoder := json.NewDecoder(r.Body)
-		var t connectStruct
-		err := decoder.Decode(&t)
-		if err != nil {
-			s.Respond(w, r, http.StatusBadRequest, errors.New("Could not decode Payload"))
-			return
-		}
-
-		if clientPointer[userid] != nil {
+		if otherClientPointer[userId] != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("Already Connected"))
 			return
 		} else {
 
-			var subscribedEvents []string
-			if len(t.Subscribe) < 1 {
-				if !Find(subscribedEvents, "All") {
-					subscribedEvents = append(subscribedEvents, "All")
-				}
-			} else {
-				for _, arg := range t.Subscribe {
-					if !Find(messageTypes, arg) {
-						log.Warn().Str("Type", arg).Msg("Message type discarded")
-						continue
-					}
-					if !Find(subscribedEvents, arg) {
-						subscribedEvents = append(subscribedEvents, arg)
-					}
-				}
+			var jid string
+			rows, _ := s.db.Query("SELECT jid FROM users where token=? LIMIT 1", userId)
+			defer rows.Close()
+			for rows.Next() {
+				rows.Scan(&jid)
 			}
-			eventstring = strings.Join(subscribedEvents, ",")
-			_, err = s.db.Exec("UPDATE users SET events=? WHERE id=?", eventstring, userid)
-			if err != nil {
-				log.Warn().Msg("Could not set events in users table")
+
+			if jid == "" {
+				s.Respond(w, r, http.StatusInternalServerError, errors.New("Please login first"))
+				return
 			}
-			log.Info().Str("events", eventstring).Msg("Setting subscribed events")
-			v := updateUserInfo(r.Context().Value("userinfo"), "Events", eventstring)
-			userinfocache.Set(token, v, cache.NoExpiration)
 
-			log.Info().Str("jid", jid).Msg("Attempt to connect")
-			killchannel[userid] = make(chan bool)
-			go s.startClient(userid, jid, token, subscribedEvents)
-
-			if t.Immediate == false {
-				log.Warn().Msg("Waiting 10 seconds")
-				time.Sleep(10000 * time.Millisecond)
-
-				if clientPointer[userid] != nil {
-					if !clientPointer[userid].IsConnected() {
-						s.Respond(w, r, http.StatusInternalServerError, errors.New("Failed to Connect"))
-						return
-					}
-				} else {
-					s.Respond(w, r, http.StatusInternalServerError, errors.New("Failed to Connect"))
-					return
-				}
-			}
+			client := NewWhatsappClient(userId, "", &jid, s.db)
+			otherClientPointer[userId] = client
+			client.waClient.Connect()
 		}
 
-		response := map[string]interface{}{"webhook": webhook, "jid": jid, "events": eventstring, "details": "Connected!"}
+		response := map[string]interface{}{"connected": true}
 		responseJson, err := json.Marshal(response)
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, err)
@@ -369,54 +337,38 @@ func (s *server) SetWebhook() http.HandlerFunc {
 	}
 }
 
-// Gets QR code encoded in Base64
+// GetQR reads from a qr code channel and streams the
+// base64 of it via a websocket
 func (s *server) GetQR() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		txtid := r.Context().Value("userinfo").(Values).Get("Id")
-		userid, _ := strconv.Atoi(txtid)
-		code := ""
+		id := r.URL.Query().Get("id")
+		name := r.URL.Query().Get("name")
+		client := NewWhatsappClient(id, name, nil, s.db)
 
-		if clientPointer[userid] == nil {
-			s.Respond(w, r, http.StatusInternalServerError, errors.New("No session"))
-			return
-		} else {
-			if clientPointer[userid].IsConnected() == false {
-				s.Respond(w, r, http.StatusInternalServerError, errors.New("Not connected"))
-				return
-			}
-			rows, err := s.db.Query("SELECT qrcode AS code FROM users WHERE id=? LIMIT 1", userid)
-			if err != nil {
-				s.Respond(w, r, http.StatusInternalServerError, err)
-				return
-			}
-			defer rows.Close()
-			for rows.Next() {
-				err = rows.Scan(&code)
-				if err != nil {
-					s.Respond(w, r, http.StatusInternalServerError, err)
-					return
-				}
-			}
-			err = rows.Err()
-			if err != nil {
-				s.Respond(w, r, http.StatusInternalServerError, err)
-				return
-			}
-			if clientPointer[userid].IsLoggedIn() == true {
-				s.Respond(w, r, http.StatusInternalServerError, errors.New("Already Loggedin"))
-				return
-			}
-		}
-
-		log.Info().Str("userid", txtid).Str("qrcode", code).Msg("Get QR successful")
-		response := map[string]interface{}{"QRCode": fmt.Sprintf("%s", code)}
-		responseJson, err := json.Marshal(response)
+		qrChan, err := client.waClient.GetQRChannel(context.Background())
 		if err != nil {
-			s.Respond(w, r, http.StatusInternalServerError, err)
-		} else {
-			s.Respond(w, r, http.StatusOK, string(responseJson))
+			fmt.Println("error", err)
 		}
-		return
+		client.waClient.Connect()
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Print("upgrade failed: ", err)
+			return
+		}
+		defer conn.Close()
+
+		for evt := range qrChan {
+			if evt.Event == "code" {
+				conn.WriteMessage(websocket.TextMessage, []byte(ToBase64Image(evt.Code)))
+			}
+			if evt.Event == "success" {
+				otherClientPointer[id] = client
+				conn.WriteMessage(websocket.TextMessage, []byte("connected"))
+				conn.Close()
+			}
+		}
+
 	}
 }
 
@@ -521,25 +473,35 @@ func (s *server) PairPhone() http.HandlerFunc {
 // Gets Connected and LoggedIn Status
 func (s *server) GetStatus() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		txtid := r.Context().Value("userinfo").(Values).Get("Id")
-		userid, _ := strconv.Atoi(txtid)
+		// txtid := r.Context().Value("userinfo").(Values).Get("Id")
+		// userid, _ := strconv.Atoi(txtid)
+		userId := r.URL.Query().Get("id")
+		sentNilError := false
 
-		if clientPointer[userid] == nil {
-			s.Respond(w, r, http.StatusInternalServerError, errors.New("No session"))
+		client := otherClientPointer[userId]
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Print("upgrade failed: ", err)
 			return
 		}
 
-		isConnected := clientPointer[userid].IsConnected()
-		isLoggedIn := clientPointer[userid].IsLoggedIn()
-
-		response := map[string]interface{}{"Connected": isConnected, "LoggedIn": isLoggedIn}
-		responseJson, err := json.Marshal(response)
-		if err != nil {
-			s.Respond(w, r, http.StatusInternalServerError, err)
-		} else {
-			s.Respond(w, r, http.StatusOK, string(responseJson))
+		for {
+			if client == nil {
+				if !sentNilError {
+					conn.WriteMessage(websocket.TextMessage, []byte("not_connected"))
+					sentNilError = true
+				}
+				client = otherClientPointer[userId]
+				continue
+			}
+			select {
+			case _ = <-client.logInCh:
+				conn.WriteMessage(websocket.TextMessage, []byte("log_in"))
+			case _ = <-client.logoutCh:
+				conn.WriteMessage(websocket.TextMessage, []byte("log_out"))
+			}
 		}
-		return
+
 	}
 }
 
@@ -1609,10 +1571,9 @@ func (s *server) SendMessage() http.HandlerFunc {
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		txtid := r.Context().Value("userinfo").(Values).Get("Id")
-		userid, _ := strconv.Atoi(txtid)
+		userId := r.URL.Query().Get("id")
 
-		client := clientPointer[userid]
+		client := otherClientPointer[userId]
 
 		if client == nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("No session"))
@@ -1648,7 +1609,7 @@ func (s *server) SendMessage() http.HandlerFunc {
 		}
 
 		if t.Id == "" {
-			msgid = client.GenerateMessageID()
+			msgid = client.waClient.GenerateMessageID()
 		} else {
 			msgid = t.Id
 		}
@@ -1661,21 +1622,7 @@ func (s *server) SendMessage() http.HandlerFunc {
 			},
 		}
 
-		// if t.ContextInfo.StanzaID != nil {
-		// 	msg.ExtendedTextMessage.ContextInfo = &waProto.ContextInfo{
-		// 		StanzaID:      proto.String(*t.ContextInfo.StanzaID),
-		// 		Participant:   proto.String(*t.ContextInfo.Participant),
-		// 		QuotedMessage: &waProto.Message{Conversation: proto.String("")},
-		// 	}
-		// }
-		// if t.ContextInfo.MentionedJID != nil {
-		// 	if msg.ExtendedTextMessage.ContextInfo == nil {
-		// 		msg.ExtendedTextMessage.ContextInfo = &waProto.ContextInfo{}
-		// 	}
-		// 	msg.ExtendedTextMessage.ContextInfo.MentionedJID = t.ContextInfo.MentionedJID
-		// }
-
-		resp, err = clientPointer[userid].SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
+		resp, err = otherClientPointer[userId].waClient.SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
 			return
@@ -3008,7 +2955,7 @@ func (s *server) DeleteUser() http.HandlerFunc {
 		userID := vars["id"]
 
 		// Delete the user from the database
-		result, err := s.db.Exec("DELETE FROM users WHERE id = ?", userID)
+		result, err := s.db.Exec("DELETE FROM users WHERE token = ?", userID)
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("Problem accessing DB"))
 			return
@@ -3019,6 +2966,14 @@ func (s *server) DeleteUser() http.HandlerFunc {
 		if rowsAffected == 0 {
 			s.Respond(w, r, http.StatusNotFound, errors.New("User not found"))
 			return
+		}
+
+		client := otherClientPointer[userID]
+		if client != nil {
+			err := client.waClient.Logout()
+			if err != nil {
+				fmt.Printf("err: %v\n", err)
+			}
 		}
 
 		// Return a success response
