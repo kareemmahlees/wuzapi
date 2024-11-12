@@ -57,8 +57,6 @@ func (s *server) authadmin(next http.Handler) http.Handler {
 
 func (s *server) authalice(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var ctx context.Context
-		userid := 0
 		txtid := ""
 		webhook := ""
 		jid := ""
@@ -86,7 +84,7 @@ func (s *server) authalice(next http.Handler) http.Handler {
 					s.Respond(w, r, http.StatusInternalServerError, err)
 					return
 				}
-				userid, _ = strconv.Atoi(txtid)
+				strconv.Atoi(txtid)
 				v := Values{map[string]string{
 					"Id":      txtid,
 					"Jid":     jid,
@@ -96,11 +94,11 @@ func (s *server) authalice(next http.Handler) http.Handler {
 				}}
 
 				userinfocache.Set(id, v, cache.NoExpiration)
-				ctx = context.WithValue(r.Context(), "userinfo", v)
+				context.WithValue(r.Context(), "userinfo", v)
 			}
 		} else {
-			ctx = context.WithValue(r.Context(), "userinfo", myuserinfo)
-			userid, _ = strconv.Atoi(myuserinfo.(Values).Get("Id"))
+			context.WithValue(r.Context(), "userinfo", myuserinfo)
+			strconv.Atoi(myuserinfo.(Values).Get("Id"))
 		}
 
 		// if userid == 0 {
@@ -108,8 +106,6 @@ func (s *server) authalice(next http.Handler) http.Handler {
 		// 	return
 		// }
 		// next.ServeHTTP(w, r.WithContext(ctx))
-		fmt.Printf("ctx: %v\n", ctx)
-		fmt.Printf("userid: %v\n", userid)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -181,7 +177,10 @@ func (s *server) Connect() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userId := r.URL.Query().Get("id")
 
-		if otherClientPointer[userId] != nil {
+		state.Lock()
+		client := state.clients[userId]
+		state.Unlock()
+		if client != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("Already Connected"))
 			return
 		} else {
@@ -199,7 +198,9 @@ func (s *server) Connect() http.HandlerFunc {
 			}
 
 			client := NewWhatsappClient(userId, "", &jid, s.db)
-			otherClientPointer[userId] = client
+			state.Lock()
+			state.clients[userId] = client
+			state.Unlock()
 			client.waClient.Connect()
 		}
 
@@ -362,11 +363,6 @@ func (s *server) GetQR() http.HandlerFunc {
 			if evt.Event == "code" {
 				conn.WriteMessage(websocket.TextMessage, []byte(ToBase64Image(evt.Code)))
 			}
-			if evt.Event == "success" {
-				otherClientPointer[id] = client
-				conn.WriteMessage(websocket.TextMessage, []byte("connected"))
-				conn.Close()
-			}
 		}
 
 	}
@@ -473,12 +469,9 @@ func (s *server) PairPhone() http.HandlerFunc {
 // Gets Connected and LoggedIn Status
 func (s *server) GetStatus() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// txtid := r.Context().Value("userinfo").(Values).Get("Id")
-		// userid, _ := strconv.Atoi(txtid)
 		userId := r.URL.Query().Get("id")
-		sentNilError := false
 
-		client := otherClientPointer[userId]
+		client := state.clients[userId]
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Print("upgrade failed: ", err)
@@ -487,18 +480,18 @@ func (s *server) GetStatus() http.HandlerFunc {
 
 		for {
 			if client == nil {
-				if !sentNilError {
-					conn.WriteMessage(websocket.TextMessage, []byte("not_connected"))
-					sentNilError = true
-				}
-				client = otherClientPointer[userId]
+				state.Lock()
+				client = state.clients[userId]
+				state.Unlock()
 				continue
 			}
 			select {
-			case _ = <-client.logInCh:
+			case <-client.logInCh:
 				conn.WriteMessage(websocket.TextMessage, []byte("log_in"))
-			case _ = <-client.logoutCh:
+			case <-client.logoutCh:
 				conn.WriteMessage(websocket.TextMessage, []byte("log_out"))
+				client = nil
+				break
 			}
 		}
 
@@ -1573,7 +1566,9 @@ func (s *server) SendMessage() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userId := r.URL.Query().Get("id")
 
-		client := otherClientPointer[userId]
+		state.Lock()
+		client := state.clients[userId]
+		state.Unlock()
 
 		if client == nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("No session"))
@@ -1622,7 +1617,9 @@ func (s *server) SendMessage() http.HandlerFunc {
 			},
 		}
 
-		resp, err = otherClientPointer[userId].waClient.SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
+		state.Lock()
+		resp, err = state.clients[userId].waClient.SendMessage(context.Background(), recipient, msg, whatsmeow.SendRequestExtra{ID: msgid})
+		state.Unlock()
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("Error sending message: %v", err)))
 			return
@@ -2968,13 +2965,20 @@ func (s *server) DeleteUser() http.HandlerFunc {
 			return
 		}
 
-		client := otherClientPointer[userID]
+		state.Lock()
+		client := state.clients[userID]
+
 		if client != nil {
 			err := client.waClient.Logout()
 			if err != nil {
 				fmt.Printf("err: %v\n", err)
 			}
 		}
+		client.logoutCh <- true
+
+		delete(state.clients, userID)
+
+		state.Unlock()
 
 		// Return a success response
 		response := map[string]interface{}{"Details": "User deleted successfully"}

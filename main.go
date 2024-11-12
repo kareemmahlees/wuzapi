@@ -15,6 +15,8 @@ import (
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
+	"sync"
+
 	"github.com/gorilla/mux"
 	"github.com/patrickmn/go-cache"
 	"github.com/rs/cors"
@@ -26,6 +28,11 @@ type server struct {
 	db     *sql.DB
 	router *mux.Router
 	exPath string
+}
+
+type State struct {
+	clients map[string]*WhatsappClient
+	sync.Mutex
 }
 
 var (
@@ -41,7 +48,10 @@ var (
 
 	killchannel   = make(map[int](chan bool))
 	userinfocache = cache.New(5*time.Minute, 10*time.Minute)
-	log           zerolog.Logger
+	state         = State{
+		clients: make(map[string]*WhatsappClient),
+	}
+	log zerolog.Logger
 )
 
 func init() {

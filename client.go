@@ -24,12 +24,27 @@ func (c *WhatsappClient) EventHandler(rawEvent any) {
 		jid := event.ID
 		c.db.Exec("INSERT INTO users (name, token, webhook, expiration, events, jid, qrcode) VALUES (?, ?, ?, ?, ?, ?, ?)",
 			c.userName, c.userId, "", 0, "Message", jid, "")
-		c.waClient.Connect()
-	case *events.Connected:
+		err := c.waClient.Connect()
+		if err != nil {
+			log.Err(err)
+		}
+
+		state.Lock()
+		state.clients[c.userId] = c
+		state.Unlock()
+
 		c.logInCh <- true
 	case *events.LoggedOut:
 		c.db.Exec("DELETE FROM users WHERE token = ?", c.userId)
-		c.waClient.Logout()
+		err := c.waClient.Logout()
+		if err != nil {
+			log.Err(err)
+		}
+
+		state.Lock()
+		delete(state.clients, c.userId)
+		state.Unlock()
+
 		c.logoutCh <- true
 	}
 
@@ -51,8 +66,8 @@ func NewWhatsappClient(userId string, userName string, jid *string, db *sql.DB) 
 		waClient = whatsmeow.NewClient(deviceStore, nil)
 	}
 
-	loggedInCh := make(chan bool)
-	logInCh := make(chan bool)
+	loggedInCh := make(chan bool, 1)
+	logInCh := make(chan bool, 1)
 	client := &WhatsappClient{
 		waClient,
 		loggedInCh,

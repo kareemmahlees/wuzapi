@@ -31,7 +31,6 @@ import (
 
 // var wlog waLog.Logger
 var clientPointer = make(map[int]*whatsmeow.Client)
-var otherClientPointer = make(map[string]*WhatsappClient)
 var clientHttp = make(map[int]*resty.Client)
 var historySyncID int32
 
