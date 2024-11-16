@@ -35,7 +35,6 @@ func (s *server) routes() {
 	adminRoutes.Handle("/users/{id}", s.DeleteUser()).Methods("DELETE")
 
 	c := alice.New()
-	c = c.Append(s.authalice)
 	c = c.Append(hlog.NewHandler(log))
 
 	// c = c.Append(hlog.AccessHandler(func(r *http.Request, status, size int, duration time.Duration) {

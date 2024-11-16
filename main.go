@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -125,6 +126,10 @@ func main() {
 		AllowedMethods: []string{"GET", "POST", "DELETE"},
 		Debug:          true,
 	}).Handler(s.router)
+
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 
 	srv := &http.Server{
 		Addr:              *address + ":" + *port,

@@ -167,6 +167,25 @@ func (s *server) auth(handler http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func (s *server) newClientIfNotExist(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userId := r.URL.Query().Get("id")
+		userName := r.URL.Query().Get("name")
+
+		state.Lock()
+		client := state.clients[userId]
+		if client == nil {
+			client = NewWhatsappClient(userId, userName, nil, s.db)
+			state.clients[userId] = client
+		}
+		state.Unlock()
+
+		ctx := context.WithValue(r.Context(), "client", client)
+
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 // Connects to Whatsapp Servers
 func (s *server) Connect() http.HandlerFunc {
 	type connectStruct struct {
@@ -176,33 +195,25 @@ func (s *server) Connect() http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		userId := r.URL.Query().Get("id")
+		userName := r.URL.Query().Get("name")
 
-		state.Lock()
-		client := state.clients[userId]
-		state.Unlock()
-		if client != nil {
-			s.Respond(w, r, http.StatusInternalServerError, errors.New("Already Connected"))
-			return
-		} else {
-
-			var jid string
-			rows, _ := s.db.Query("SELECT jid FROM users where token=? LIMIT 1", userId)
-			defer rows.Close()
-			for rows.Next() {
-				rows.Scan(&jid)
-			}
-
-			if jid == "" {
-				s.Respond(w, r, http.StatusInternalServerError, errors.New("Please login first"))
-				return
-			}
-
-			client := NewWhatsappClient(userId, "", &jid, s.db)
-			state.Lock()
-			state.clients[userId] = client
-			state.Unlock()
-			client.waClient.Connect()
+		var jid string
+		rows, _ := s.db.Query("SELECT jid FROM users where token=? LIMIT 1", userId)
+		defer rows.Close()
+		for rows.Next() {
+			rows.Scan(&jid)
 		}
+
+		if jid == "" {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("Please login first"))
+			return
+		}
+
+		client := NewWhatsappClient(userId, userName, &jid, s.db)
+		state.Lock()
+		state.clients[userId] = client
+		state.Unlock()
+		client.waClient.Connect()
 
 		response := map[string]interface{}{"connected": true}
 		responseJson, err := json.Marshal(response)
@@ -342,15 +353,31 @@ func (s *server) SetWebhook() http.HandlerFunc {
 // base64 of it via a websocket
 func (s *server) GetQR() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		id := r.URL.Query().Get("id")
-		name := r.URL.Query().Get("name")
-		client := NewWhatsappClient(id, name, nil, s.db)
+		userId := r.URL.Query().Get("id")
+		userName := r.URL.Query().Get("name")
+
+		var client *WhatsappClient
+
+		state.Lock()
+		if state.clients[userId] != nil {
+			client = state.clients[userId]
+		} else {
+			client = NewWhatsappClient(userId, userName, nil, s.db)
+			state.clients[userId] = client
+		}
+		state.Unlock()
+
+		fmt.Printf("clients from qr code state.clients: %v\n", state.clients)
+		fmt.Println("client id:", client.userId)
 
 		qrChan, err := client.waClient.GetQRChannel(context.Background())
 		if err != nil {
 			fmt.Println("error", err)
 		}
-		client.waClient.Connect()
+		err = client.waClient.Connect()
+		if err != nil {
+			fmt.Println("error", err)
+		}
 
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -362,6 +389,11 @@ func (s *server) GetQR() http.HandlerFunc {
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				conn.WriteMessage(websocket.TextMessage, []byte(ToBase64Image(evt.Code)))
+			}
+			if evt.Event == "success" {
+				conn.WriteMessage(websocket.TextMessage, []byte("logged_in"))
+				conn.Close()
+				break
 			}
 		}
 
@@ -469,9 +501,12 @@ func (s *server) PairPhone() http.HandlerFunc {
 // Gets Connected and LoggedIn Status
 func (s *server) GetStatus() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		userId := r.URL.Query().Get("id")
+		id := r.URL.Query().Get("id")
 
-		client := state.clients[userId]
+		state.Lock()
+		client := state.clients[id]
+		state.Unlock()
+
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Print("upgrade failed: ", err)
@@ -479,19 +514,10 @@ func (s *server) GetStatus() http.HandlerFunc {
 		}
 
 		for {
-			if client == nil {
-				state.Lock()
-				client = state.clients[userId]
-				state.Unlock()
-				continue
-			}
 			select {
-			case <-client.logInCh:
-				conn.WriteMessage(websocket.TextMessage, []byte("log_in"))
 			case <-client.logoutCh:
+				fmt.Println("recieved from logout channel")
 				conn.WriteMessage(websocket.TextMessage, []byte("log_out"))
-				client = nil
-				break
 			}
 		}
 
@@ -2951,6 +2977,22 @@ func (s *server) DeleteUser() http.HandlerFunc {
 		vars := mux.Vars(r)
 		userID := vars["id"]
 
+		state.Lock()
+		client := state.clients[userID]
+
+		if client != nil {
+			err := client.waClient.Logout()
+			if err != nil {
+				fmt.Printf("err: %v\n", err)
+			}
+		}
+
+		client.logoutCh <- true
+
+		delete(state.clients, userID)
+
+		state.Unlock()
+
 		// Delete the user from the database
 		result, err := s.db.Exec("DELETE FROM users WHERE token = ?", userID)
 		if err != nil {
@@ -2964,21 +3006,6 @@ func (s *server) DeleteUser() http.HandlerFunc {
 			s.Respond(w, r, http.StatusNotFound, errors.New("User not found"))
 			return
 		}
-
-		state.Lock()
-		client := state.clients[userID]
-
-		if client != nil {
-			err := client.waClient.Logout()
-			if err != nil {
-				fmt.Printf("err: %v\n", err)
-			}
-		}
-		client.logoutCh <- true
-
-		delete(state.clients, userID)
-
-		state.Unlock()
 
 		// Return a success response
 		response := map[string]interface{}{"Details": "User deleted successfully"}
